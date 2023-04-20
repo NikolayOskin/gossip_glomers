@@ -62,9 +62,29 @@ func newNodeState() *nodeState {
 	}
 }
 
+type nMessage struct {
+	message int
+	nodeID  string
+}
+
 func main() {
 	node := newNodeState()
 	n := maelstrom.NewNode()
+
+	ch := make(chan nMessage, 1000)
+
+	go func() {
+		for c := range ch {
+			ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*100)
+			_, err := n.SyncRPC(ctx, c.nodeID, map[string]any{
+				"type":    "sync",
+				"message": c.message,
+			})
+			if err != nil {
+				ch <- c
+			}
+		}
+	}()
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
 		var reqBody map[string]any
@@ -93,33 +113,6 @@ func main() {
 		})
 	})
 
-	go func() {
-		for k, _ := range node.neighborNodes {
-			node.mu.Lock()
-			a := make([]int, 0, len(node.neighborNodes[k]))
-			copy(a, node.neighborNodes[k])
-			node.mu.Unlock()
-
-			if len(a) == 0 {
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-
-			for _, v := range a {
-				ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*500)
-				_, err := n.SyncRPC(ctx, k, map[string]any{
-					"type":    "sync",
-					"message": v,
-				})
-				if err != nil {
-					break
-				}
-			}
-
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var reqBody map[string]any
 		if err := json.Unmarshal(msg.Body, &reqBody); err != nil {
@@ -142,11 +135,14 @@ func main() {
 			syncRequestBody["type"] = "sync"
 			syncRequestBody["message"] = messageNum
 
-			ctx, _ := context.WithTimeout(context.Background(), time.Second)
+			ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*300)
 
 			_, err := n.SyncRPC(ctx, nNode, syncRequestBody)
 			if err != nil {
-				node.addMessageToSend(nNode, int(messageNum))
+				ch <- nMessage{
+					nodeID:  nNode,
+					message: int(messageNum),
+				}
 			}
 		}
 
