@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"sync"
 	"time"
 
@@ -19,7 +18,7 @@ const sendTimeout = time.Millisecond * 80
 type nodeState struct {
 	mu             sync.Mutex
 	neighborNodes  []string
-	messages       map[int]struct{}
+	messages       []int
 	failedMessages failedMessages
 }
 
@@ -30,21 +29,14 @@ func (ns *nodeState) addNeighborNodeID(nodeID string) {
 func (ns *nodeState) addMessage(message int) {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
-	ns.messages[message] = struct{}{}
+	ns.messages = append(ns.messages, message)
 }
 
 func (ns *nodeState) messagesList() []int {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 
-	messages := make([]int, 0, len(ns.messages))
-	for k, _ := range ns.messages {
-		messages = append(messages, k)
-	}
-
-	sort.Ints(messages)
-
-	return messages
+	return ns.messages
 }
 
 type failedMessage struct {
@@ -87,7 +79,6 @@ func (fm *failedMessages) moveFirstToBack() {
 
 func newNodeState() *nodeState {
 	return &nodeState{
-		messages: make(map[int]struct{}),
 		failedMessages: failedMessages{
 			list: list.New(),
 		},
