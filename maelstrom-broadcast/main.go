@@ -1,23 +1,32 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-type nodeState struct {
-	mu            sync.Mutex
-	neighborNodes []string
-	messages      map[int]struct{}
+type neighbor struct {
+	messagesToSend []int
+	id             string
 }
 
-func (ns *nodeState) addNeighborNode(node string) {
-	ns.neighborNodes = append(ns.neighborNodes, node)
+type nodeState struct {
+	mu            sync.Mutex
+	neighborNodes map[string][]int
+	messages      map[int]struct{}
+	updatedAt     time.Time
+}
+
+func (ns *nodeState) addNeighborNodeID(nodeID string) {
+	ns.neighborNodes[nodeID] = make([]int, 0)
 }
 
 func (ns *nodeState) addMessage(message int) {
@@ -35,12 +44,21 @@ func (ns *nodeState) messagesList() []int {
 		messages = append(messages, k)
 	}
 
+	sort.Ints(messages)
+
 	return messages
+}
+
+func (ns *nodeState) addMessageToSend(nodeID string, message int) {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	ns.neighborNodes[nodeID] = append(ns.neighborNodes[nodeID], message)
 }
 
 func newNodeState() *nodeState {
 	return &nodeState{
-		messages: make(map[int]struct{}),
+		messages:      make(map[int]struct{}),
+		neighborNodes: make(map[string][]int),
 	}
 }
 
@@ -54,19 +72,19 @@ func main() {
 			return err
 		}
 
-		topology, ok := reqBody["topology"]
+		topologyField, ok := reqBody["topology"]
 		if !ok {
 			return fmt.Errorf("topology is not set")
 		}
 
-		topologyMap, ok := topology.(map[string]any)
+		topology, ok := topologyField.(map[string]any)
 		if !ok {
-			return fmt.Errorf("topology has wrong type %v", topology)
+			return fmt.Errorf("topologyField has wrong type %v", topologyField)
 		}
 
-		for k, _ := range topologyMap {
-			if k != n.ID() {
-				node.addNeighborNode(k)
+		for nodeID, _ := range topology {
+			if nodeID != n.ID() {
+				node.addNeighborNodeID(nodeID)
 			}
 		}
 
@@ -74,6 +92,33 @@ func main() {
 			"type": "topology_ok",
 		})
 	})
+
+	go func() {
+		for k, _ := range node.neighborNodes {
+			node.mu.Lock()
+			a := make([]int, 0, len(node.neighborNodes[k]))
+			copy(a, node.neighborNodes[k])
+			node.mu.Unlock()
+
+			if len(a) == 0 {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			for _, v := range a {
+				ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*500)
+				_, err := n.SyncRPC(ctx, k, map[string]any{
+					"type":    "sync",
+					"message": v,
+				})
+				if err != nil {
+					break
+				}
+			}
+
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var reqBody map[string]any
@@ -92,14 +137,16 @@ func main() {
 
 		node.addMessage(int(messageNum))
 
-		for _, node := range node.neighborNodes {
+		for nNode, _ := range node.neighborNodes {
 			syncRequestBody := make(map[string]any)
 			syncRequestBody["type"] = "sync"
 			syncRequestBody["message"] = messageNum
 
-			err := n.Send(node, syncRequestBody)
+			ctx, _ := context.WithTimeout(context.Background(), time.Second)
+
+			_, err := n.SyncRPC(ctx, nNode, syncRequestBody)
 			if err != nil {
-				return err
+				node.addMessageToSend(nNode, int(messageNum))
 			}
 		}
 
