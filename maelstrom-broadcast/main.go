@@ -7,19 +7,20 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-const sendTimeout = time.Millisecond * 80
+const sendTimeout = time.Millisecond * 50
 
 type nodeState struct {
 	mu             sync.Mutex
 	neighborNodes  []string
-	messages       []int
-	failedMessages failedMessages
+	messages       map[int]struct{}
+	failedMessages map[string]*failedMessages
 }
 
 func (ns *nodeState) addNeighborNodeID(nodeID string) {
@@ -29,14 +30,22 @@ func (ns *nodeState) addNeighborNodeID(nodeID string) {
 func (ns *nodeState) addMessage(message int) {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
-	ns.messages = append(ns.messages, message)
+	ns.messages[message] = struct{}{}
 }
 
 func (ns *nodeState) messagesList() []int {
 	ns.mu.Lock()
 	defer ns.mu.Unlock()
 
-	return ns.messages
+	var l []int
+
+	for k := range ns.messages {
+		l = append(l, k)
+	}
+
+	sort.Ints(l)
+
+	return l
 }
 
 type failedMessage struct {
@@ -45,7 +54,7 @@ type failedMessage struct {
 }
 
 type failedMessages struct {
-	mu   sync.Mutex
+	mu   *sync.Mutex
 	list *list.List
 }
 
@@ -79,9 +88,8 @@ func (fm *failedMessages) moveFirstToBack() {
 
 func newNodeState() *nodeState {
 	return &nodeState{
-		failedMessages: failedMessages{
-			list: list.New(),
-		},
+		failedMessages: make(map[string]*failedMessages),
+		messages:       make(map[int]struct{}),
 	}
 }
 
@@ -89,25 +97,30 @@ func main() {
 	node := newNodeState()
 	n := maelstrom.NewNode()
 
-	go func() {
-		for {
-			msg, ok := node.failedMessages.first()
-			if !ok {
-				// empty list
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
+	workerFn := func() {
+		for _, nodeFailedMessages := range node.failedMessages {
+			fm := nodeFailedMessages
+			go func() {
+				for {
+					msg, ok := fm.first()
+					if !ok {
+						// empty list
+						time.Sleep(10 * time.Millisecond)
+						continue
+					}
 
-			ctx, _ := context.WithTimeout(context.Background(), sendTimeout)
-			_, err := n.SyncRPC(ctx, msg.nodeID, map[string]any{
-				"type":    "sync",
-				"message": msg.message,
-			})
-			if err != nil {
-				node.failedMessages.moveFirstToBack()
-			}
+					ctx, _ := context.WithTimeout(context.Background(), sendTimeout)
+					_, err := n.SyncRPC(ctx, msg.nodeID, map[string]any{
+						"type":    "sync",
+						"message": msg.message,
+					})
+					if err != nil {
+						fm.moveFirstToBack()
+					}
+				}
+			}()
 		}
-	}()
+	}
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
 		var reqBody map[string]any
@@ -128,8 +141,14 @@ func main() {
 		for nodeID, _ := range topology {
 			if nodeID != n.ID() {
 				node.addNeighborNodeID(nodeID)
+				node.failedMessages[nodeID] = &failedMessages{
+					list: list.New(),
+					mu:   &sync.Mutex{},
+				}
 			}
 		}
+
+		workerFn()
 
 		return n.Reply(msg, map[string]string{
 			"type": "topology_ok",
@@ -154,19 +173,25 @@ func main() {
 		node.addMessage(int(messageNum))
 
 		for _, nNode := range node.neighborNodes {
-			syncRequestBody := make(map[string]any)
-			syncRequestBody["type"] = "sync"
-			syncRequestBody["message"] = messageNum
+			nNode := nNode
+			go func() {
+				syncRequestBody := map[string]any{
+					"type":    "sync",
+					"message": messageNum,
+				}
 
-			ctx, _ := context.WithTimeout(context.Background(), sendTimeout)
-
-			_, err := n.SyncRPC(ctx, nNode, syncRequestBody)
-			if err != nil {
-				node.failedMessages.add(failedMessage{
-					nodeID:  nNode,
-					message: int(messageNum),
-				})
-			}
+				ctx, _ := context.WithTimeout(context.Background(), sendTimeout)
+				_, err := n.SyncRPC(ctx, nNode, syncRequestBody)
+				if err != nil {
+					nodeFailedMessages, _ := node.failedMessages[nNode]
+					nodeFailedMessages.add(
+						failedMessage{
+							message: int(messageNum),
+							nodeID:  nNode,
+						},
+					)
+				}
+			}()
 		}
 
 		return n.Reply(msg, map[string]string{
