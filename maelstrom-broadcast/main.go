@@ -17,10 +17,10 @@ import (
 const sendTimeout = time.Millisecond * 50
 
 type nodeState struct {
-	mu             sync.Mutex
-	neighborNodes  []string
-	messages       map[int]struct{}
-	failedMessages map[string]*failedMessages
+	mu                     sync.Mutex
+	neighborNodes          []string
+	messages               map[int]struct{}
+	neighborFailedMessages map[string]failedMessages
 }
 
 func (ns *nodeState) addNeighborNodeID(nodeID string) {
@@ -48,31 +48,26 @@ func (ns *nodeState) messagesList() []int {
 	return l
 }
 
-type failedMessage struct {
-	message int
-	nodeID  string
-}
-
 type failedMessages struct {
 	mu   *sync.Mutex
 	list *list.List
 }
 
-func (fm *failedMessages) add(message failedMessage) {
+func (fm *failedMessages) add(message int) {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 	fm.list.PushBack(message)
 }
 
-func (fm *failedMessages) first() (failedMessage, bool) {
+func (fm *failedMessages) first() (int, bool) {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
 	elem := fm.list.Front()
 	if elem == nil {
-		return failedMessage{}, false
+		return 0, false
 	}
 
-	msg, _ := elem.Value.(failedMessage)
+	msg, _ := elem.Value.(int)
 
 	return msg, true
 }
@@ -88,8 +83,8 @@ func (fm *failedMessages) moveFirstToBack() {
 
 func newNodeState() *nodeState {
 	return &nodeState{
-		failedMessages: make(map[string]*failedMessages),
-		messages:       make(map[int]struct{}),
+		neighborFailedMessages: make(map[string]failedMessages),
+		messages:               make(map[int]struct{}),
 	}
 }
 
@@ -98,11 +93,12 @@ func main() {
 	n := maelstrom.NewNode()
 
 	workerFn := func() {
-		for _, nodeFailedMessages := range node.failedMessages {
-			fm := nodeFailedMessages
+		for nodeID, nodeFailedMessages := range node.neighborFailedMessages {
+			nodeMessages := nodeFailedMessages
+			nID := nodeID
 			go func() {
 				for {
-					msg, ok := fm.first()
+					msg, ok := nodeMessages.first()
 					if !ok {
 						// empty list
 						time.Sleep(10 * time.Millisecond)
@@ -110,12 +106,12 @@ func main() {
 					}
 
 					ctx, _ := context.WithTimeout(context.Background(), sendTimeout)
-					_, err := n.SyncRPC(ctx, msg.nodeID, map[string]any{
+					_, err := n.SyncRPC(ctx, nID, map[string]any{
 						"type":    "sync",
-						"message": msg.message,
+						"message": msg,
 					})
 					if err != nil {
-						fm.moveFirstToBack()
+						nodeMessages.moveFirstToBack()
 					}
 				}
 			}()
@@ -141,7 +137,7 @@ func main() {
 		for nodeID, _ := range topology {
 			if nodeID != n.ID() {
 				node.addNeighborNodeID(nodeID)
-				node.failedMessages[nodeID] = &failedMessages{
+				node.neighborFailedMessages[nodeID] = failedMessages{
 					list: list.New(),
 					mu:   &sync.Mutex{},
 				}
@@ -183,13 +179,8 @@ func main() {
 				ctx, _ := context.WithTimeout(context.Background(), sendTimeout)
 				_, err := n.SyncRPC(ctx, nNode, syncRequestBody)
 				if err != nil {
-					nodeFailedMessages, _ := node.failedMessages[nNode]
-					nodeFailedMessages.add(
-						failedMessage{
-							message: int(messageNum),
-							nodeID:  nNode,
-						},
-					)
+					nodeFailedMessages, _ := node.neighborFailedMessages[nNode]
+					nodeFailedMessages.add(int(messageNum))
 				}
 			}()
 		}
