@@ -12,6 +12,8 @@ import (
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+const kvTimeout = time.Millisecond * 100
+
 func main() {
 	node := maelstrom.NewNode()
 	kv := maelstrom.NewSeqKV(node)
@@ -35,7 +37,7 @@ func main() {
 		var gCounter int
 
 		for _, nodeID := range node.NodeIDs() {
-			ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*100)
+			ctx, _ := context.WithTimeout(context.Background(), kvTimeout)
 			nodeCounter, err := kv.ReadInt(ctx, nodeID)
 			if err != nil && maelstrom.ErrorCode(err) != maelstrom.KeyDoesNotExist {
 				return fmt.Errorf("ReadInt: %w", err)
@@ -61,22 +63,16 @@ func main() {
 		}
 		deltaNum, ok := delta.(float64)
 		if !ok {
-			return errors.New("message type invalid")
+			return errors.New("delta type invalid")
 		}
 
-		if deltaNum <= 0 {
-			return node.Reply(msg, map[string]any{
-				"type": "add_ok",
-			})
-		}
-
-		ctx, _ := context.WithTimeout(context.Background(), time.Millisecond*100)
+		ctx, _ := context.WithTimeout(context.Background(), kvTimeout)
 		nodeCounter, err := kv.ReadInt(ctx, node.ID())
 		if err != nil && maelstrom.ErrorCode(err) != maelstrom.KeyDoesNotExist {
 			return fmt.Errorf("ReadInt: %w", err)
 		}
 
-		ctx, _ = context.WithTimeout(context.Background(), time.Millisecond*100)
+		ctx, _ = context.WithTimeout(context.Background(), kvTimeout)
 		err = kv.CompareAndSwap(
 			ctx,
 			node.ID(),
